@@ -12,7 +12,7 @@ GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 # Check if the token is set
 if [[ -z "$GITHUB_TOKEN" ]]; then
-  echo "Warning: No GITHUB_TOKEN found. API requests are limited to 60 per hour." >&2
+#  echo "Warning: No GITHUB_TOKEN found. API requests are limited to 60 per hour." >&2
   AUTH_HEADER=""
 else
   AUTH_HEADER="-H Authorization: token ${GITHUB_TOKEN}"
