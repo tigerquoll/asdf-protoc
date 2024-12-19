@@ -1,18 +1,57 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-releases_path=https://api.github.com/repos/protocolbuffers/protobuf/releases
-cmd="curl -fSs"
-if [ -n "$OAUTH_TOKEN" ]; then
-  cmd="$cmd -H 'Authorization: token $OAUTH_TOKEN'"
+# GitHub API base URL
+GITHUB_API=https://api.github.com/repos/protocolbuffers/protobuf/releases
+
+# GitHub API base URL
+PER_PAGE=100 # Maximum number of results per page
+
+# GitHub Personal Access Token (use an environment variable for security)
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+# Check if the token is set
+if [[ -z "$GITHUB_TOKEN" ]]; then
+  echo "Warning: No GITHUB_TOKEN found. API requests are limited to 60 per hour." >&2
+  AUTH_HEADER=""
+else
+  AUTH_HEADER="-H Authorization: token ${GITHUB_TOKEN}"
 fi
-cmd="$cmd $releases_path"
 
-# stolen from https://github.com/rbenv/ruby-build/pull/631/files#diff-fdcfb8a18714b33b07529b7d02b54f1dR942
-function sort_versions() {
-  sed 'h; s/[+-]/./g; s/.p\([[:digit:]]\)/.z\1/; s/$/.z/; G; s/\n/ /' | \
-    LC_ALL=C sort -t. -k 1,1 -k 2,2n -k 3,3n -k 4,4n -k 5,5n | awk '{print $2}'
+# Fetch all releases using the GitHub API and handle pagination
+fetch_releases() {
+  local page=1
+  local versions=()
+  while :; do
+    # Fetch the releases for the current page
+    response=$(curl -sSL -H "Accept: application/vnd.github.v3+json" ${AUTH_HEADER:-} \
+      "${GITHUB_API}?per_page=${PER_PAGE}&page=${page}")
+
+    # Check if the response is valid JSON
+    if ! echo "$response" | jq empty >/dev/null 2>&1; then
+      echo "Error: Invalid response from GitHub API. Response was:" >&2
+      echo "$response" >&2
+      exit 1
+    fi
+
+    # Extract tag names of non-prerelease releases
+    releases=$(echo "$response" | jq -r '.[] | select(.prerelease == false) | .tag_name')
+
+    # Break the loop if there are no more releases
+    if [[ -z "$releases" ]]; then
+      break
+    fi
+
+    # Add releases to the versions array
+    versions+=($releases)
+
+    # Increment the page number
+    page=$((page + 1))
+  done
+
+  # Print all versions
+  printf "%s\n" "${versions[@]}"
 }
 
-# Fetch all tag names, and get only second column. Then remove all unnecesary characters.
-versions=$(eval $cmd | grep -oE "tag_name\": *\".{1,15}\"," | sed 's/tag_name\": *\"v//;s/\",//' | sort_versions)
-echo $versions
+# Execute the function
+fetch_releases
