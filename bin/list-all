@@ -1,57 +1,135 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 # GitHub API base URL
 GITHUB_API=https://api.github.com/repos/protocolbuffers/protobuf/releases
 
-# GitHub API base URL
-PER_PAGE=100 # Maximum number of results per page
-
-# GitHub Personal Access Token (use an environment variable for security)
+PER_PAGE=100
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+TIMEOUT=10  # Timeout in seconds for each request
 
-# Check if the token is set
+# Handle missing token with a warning
 if [[ -z "$GITHUB_TOKEN" ]]; then
-#  echo "Warning: No GITHUB_TOKEN found. API requests are limited to 60 per hour." >&2
   AUTH_HEADER=""
+  echo "Warning: No GITHUB_TOKEN found. API requests are limited to 60 per hour." >&2
 else
   AUTH_HEADER="-H Authorization: token ${GITHUB_TOKEN}"
 fi
 
-# Fetch all releases using the GitHub API and handle pagination
-fetch_releases() {
+# Function to handle rate limiting
+handle_rate_limit() {
+  local headers="$1"
+  rate_limit_remaining=$(echo "$headers" | awk '/^X-RateLimit-Remaining:/ {print $2}' | tr -d '\r')
+  rate_limit_reset=$(echo "$headers" | awk '/^X-RateLimit-Reset:/ {print $2}' | tr -d '\r')
+
+  if [[ "${rate_limit_remaining:-1}" -eq 0 ]]; then
+    current_time=$(date +%s)
+    wait_time=$((rate_limit_reset - current_time))
+    if [[ "$wait_time" -gt 0 ]]; then
+      echo "Rate limit exceeded. Waiting for $wait_time seconds..." >&2
+      sleep "$wait_time"
+    fi
+  fi
+}
+
+# Fetch releases with error handling
+fetch_releases_page() {
+  local url="$1"
+  local headers_file=$(mktemp)
+  local body_file=$(mktemp)
+  local http_status
+
+  # Fetch the data with timeout, capture headers, body, and status code
+  http_status=$(curl -sSL --connect-timeout $TIMEOUT --max-time $TIMEOUT \
+    -H "Accept: application/vnd.github.v3+json" ${AUTH_HEADER:-} \
+    -w "%{http_code}" -D "$headers_file" -o "$body_file" "$url")
+
+  # Handle HTTP errors
+  if [[ "$http_status" -ne 200 ]]; then
+    case "$http_status" in
+      401)
+        echo "Error: Unauthorized (401). Check your GITHUB_TOKEN." >&2
+        ;;
+      403)
+        echo "Error: Forbidden (403). You may have hit the rate limit." >&2
+        ;;
+      404)
+        echo "Error: Not Found (404). Check the repository URL." >&2
+        ;;
+      500)
+        echo "Error: Internal Server Error (500). GitHub may be experiencing issues." >&2
+        ;;
+      502|503|504)
+        echo "Error: GitHub service is unavailable ($http_status). Please try again later." >&2
+        ;;
+      *)
+        echo "Error: HTTP request failed with status code $http_status." >&2
+        ;;
+    esac
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+
+  # Handle rate limiting
+  handle_rate_limit "$(cat "$headers_file")"
+
+  # Validate JSON response
+  if ! jq empty "$body_file" >/dev/null 2>&1; then
+    echo "Error: Invalid JSON response from GitHub API." >&2
+    cat "$body_file" >&2
+    rm -f "$headers_file" "$body_file"
+    exit 1
+  fi
+
+  # Return the body file path
+  echo "$body_file"
+
+  # Clean up headers
+  rm -f "$headers_file"
+}
+
+
+fetch_versions() {
   local page=1
   local versions=()
-  while :; do
-    # Fetch the releases for the current page
-    response=$(curl -sSL -H "Accept: application/vnd.github.v3+json" ${AUTH_HEADER:-} \
-      "${GITHUB_API}?per_page=${PER_PAGE}&page=${page}")
 
-    # Check if the response is valid JSON
-    if ! echo "$response" | jq empty >/dev/null 2>&1; then
-      echo "Error: Invalid response from GitHub API. Response was:" >&2
-      echo "$response" >&2
+  while :; do
+    # Fetch releases for the current page
+    url="${GITHUB_API}?per_page=${PER_PAGE}&page=${page}"
+    body_file=$(fetch_releases_page "$url")
+
+    # Validate JSON response
+    if ! jq empty "$body_file" >/dev/null 2>&1; then
+      echo "Error: Invalid JSON response from GitHub API." >&2
+      cat "$body_file" >&2
+      rm -f "$body_file"
       exit 1
     fi
 
-    # Extract tag names of non-prerelease releases
-    releases=$(echo "$response" | jq -r '.[] | select(.prerelease == false) | .tag_name')
+    # Extract non-pre-release versions
+    releases=$(jq -r '
+      .[] | select(.prerelease == false) | .tag_name
+    ' "$body_file")
 
-    # Break the loop if there are no more releases
+    # Handle empty or invalid results
     if [[ -z "$releases" ]]; then
+      echo "No valid versions found on page $page." >&2
+      rm -f "$body_file"
       break
     fi
 
-    # Add releases to the versions array
+    # Append valid versions to the array
     versions+=($releases)
 
-    # Increment the page number
+    # Clean up body file
+    rm -f "$body_file"
+
+    # Go to the next page
     page=$((page + 1))
   done
 
-  # Print all versions
-  printf "%s\n" "${versions[@]}"
+  # Return the versions as a space-separated list
+  printf "%s " "${versions[@]}"
 }
 
-# Execute the function
-fetch_releases
+fetch_versions
